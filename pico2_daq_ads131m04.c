@@ -3,6 +3,7 @@
 // RP2350 Pico2 board as the DAQ-MCU, getting data from an ADS131M04 chip.
 //
 // PJ 2025-07-12: Adapt the interpreter from the BU79100G firmware.
+//    2025-07-13: Functions to drive the ADS131M04 with default settings.
 //
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
