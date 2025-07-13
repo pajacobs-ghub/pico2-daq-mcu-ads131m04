@@ -18,7 +18,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.1 2025-07-12 Pico2 as DAQ-MCU"
+#define VERSION_STR "v0.2 2025-07-13 Pico2 as DAQ-MCU"
 
 // Names for the GPIO pins.
 const uint READY_PIN = 22;
@@ -104,7 +104,6 @@ static uint8_t incoming_bytes_adc[N_BYTES_IN_FRAME];
 static uint8_t outgoing_bytes_adc[N_BYTES_IN_FRAME];
 
 static int sampling_error_flag;
-static uint8_t event_n;
 
 // Parameters controlling the device are stored in virtual config registers.
 #define NUMREG 7
@@ -112,12 +111,13 @@ int32_t vregister[NUMREG];
 
 void set_registers_to_original_values()
 {
-    vregister[0] = 8192;   // Master clock frequency f_CLKIN for ADS131M04, in kHz
-    vregister[1] = 1024;   // Over-sampling ratio for the ADS131M04.
+    // [FIX-ME] Slow f_CLKIN for stripboard prototype.
+    vregister[0] = 8192/4; // Master clock frequency f_CLKIN for ADS131M04, in kHz
+    vregister[1] = 1024;   // Over-sampling ratio for the ADS131M04, default 1024.
     vregister[2] = 128;    // number of samples in record after trigger event
     vregister[3] = 0;      // trigger mode 0=immediate, 1=internal, 2=external
     vregister[4] = 0;      // trigger channel for internal trigger
-    vregister[5] = 1000;   // trigger level as a signed integer
+    vregister[5] = 10000;  // trigger level as a signed integer
     vregister[6] = 1;      // trigger slope 0=sample-below-level 1=sample-above-level
 }
 
@@ -126,9 +126,22 @@ static inline uint32_t oldest_fullword_index_in_data()
     return (fullword_index_has_wrapped_around) ? next_fullword_index_in_data : 0;
 }
 
-static inline void assert_adc_synch()
+static inline int assert_adc_synch(uint32_t duration_us, uint64_t timeout)
 {
-    // [TODO]
+    // We assume that the master clock to the ADS131M04 is already running.
+    // To meet the timing requirement in Figure 6-2 of the ADS131M04 data sheet,
+    // wait for a trailing edge of CLKIN and then pulse the SYNCH pin low.
+    // This waiting will timeout if CLKIN is not running.
+    while (!gpio_get(CLKIN_PIN)) {
+        if (time_reached(timeout)) return 1;
+    }
+    while (gpio_get(CLKIN_PIN)) {
+        if (time_reached(timeout)) return 1;
+    }
+    gpio_put(SYNCHn_PIN, 0);
+    busy_wait_us(duration_us);
+    gpio_put(SYNCHn_PIN, 1);
+    return 0;
 }
 
 static inline int wait_for_adc_data_ready(uint64_t timeout)
@@ -141,20 +154,33 @@ static inline int wait_for_adc_data_ready(uint64_t timeout)
 
 static inline void set_adc_command(uint16_t cmd)
 {
-    outgoing_bytes_adc[0] = (uint8_t)(cmd >> 8);
+    outgoing_bytes_adc[0] = (uint8_t)((cmd & 0xff00) >> 8);
     outgoing_bytes_adc[1] = (uint8_t)(cmd & 0x00ff);
-    for (uint i = 2; i < N_BYTES_IN_FRAME; ++i) outgoing_bytes_adc[i] = (uint8_t)0;
+    for (uint i = 2; i < N_BYTES_IN_FRAME; ++i) {
+        outgoing_bytes_adc[i] = (uint8_t)0;
+    }
 }
 
-static inline int read_full_adc_frame()
+static inline void read_full_adc_frame()
 {
-    // [TODO]
-    return 0;
+    gpio_put(SPI1_CSn_PIN, 0); // Select the ADS131M04.
+    busy_wait_us(1);
+    spi_write_read_blocking(spi1, outgoing_bytes_adc, incoming_bytes_adc, N_BYTES_IN_FRAME);
+    gpio_put(SPI1_CSn_PIN, 1); // Deselect.
 }
 
 static inline void unpack_adc_sample_data()
 {
-    // [TODO]
+    for (int ch=0; ch < N_CHAN; ++ch) {
+        int32_t word = 0L;
+        uint ib = (1+ch)*3; // index of the high-byte for channel ch.
+        word |= (uint32_t)incoming_bytes_adc[ib] << 16;
+        word |= (uint32_t)incoming_bytes_adc[ib+1] << 8;
+        word |= (uint32_t)incoming_bytes_adc[ib+2];
+        // Sign-extend to the full 32-bit word.
+        if (word & (1L << 23)) word |= 0xFF000000L;
+        sample_data[ch] = word;
+    }
 }
 
 int __no_inline_not_in_flash_func(sample_channels)(void)
@@ -178,7 +204,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // Get configuration data from virtual registers.
     uint32_t f_CLKIN_kHz = vregister[0];
     uint32_t OSR = vregister[1];
-    int32_t period_us = 2000L * OSR / f_CLKIN_kHz;
+    int32_t sample_period_us = 2000L * OSR / f_CLKIN_kHz;
     //
     // [FIX-ME] Need to set the CLOCK register on the ADS131M04 to a suitable value.
     // For the moment, we assume the default OSR=1024 and f_CLKIN = 8192kHz,
@@ -204,19 +230,29 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // we use PWM slice 4A on GPIO8 (CLKIN_PIN).
     uint slice_num = pwm_gpio_to_slice_num(CLKIN_PIN);
     pwm_set_wrap(slice_num, 3);
+    pwm_set_enabled(slice_num, false); // In case it has been left on from previous sampling.
     pwm_set_chan_level(slice_num, PWM_CHAN_A, 2);
     uint f_clk_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS);
-    float div = (float)f_clk_sys / f_CLKIN_kHz;
+    float div = (float)f_clk_sys / f_CLKIN_kHz / 4;
     pwm_set_clkdiv(slice_num, div);
     pwm_set_enabled(slice_num, true);
+    busy_wait_us(100); // Let the ADS131M04 registers settle.
     //
     set_adc_command(0); // NULL command; we just want to read sampled data.
-    assert_adc_synch();
-    uint64_t timeout = time_us_64() + 3*period_us + 10;
+    //
+    // Assert the SYNCHn pin low long enough to reset the ADS131M04.
+    uint64_t timeout = time_us_64() + 10;
+    uint64_t period_CLKIN_ns = 1000000 / f_CLKIN_kHz;
+    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 99;
+    //
+    // Now read two frames and discard. (This may not be necessary.)
+    timeout = time_us_64() + 3*sample_period_us + 10;
     if (wait_for_adc_data_ready(timeout)) return 1;
+    busy_wait_us(1);
     read_full_adc_frame();
-    timeout = time_us_64() + period_us + 10;
+    timeout = time_us_64() + sample_period_us + 10;
     if (wait_for_adc_data_ready(timeout)) return 2;
+    busy_wait_us(1);
     read_full_adc_frame();
     //
     while (samples_remaining > 0) {
@@ -224,8 +260,9 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         raise_flag_pin(); // to allow timing via a logic probe.
         //
         // Take the analog sample set.
-        timeout = time_us_64() + period_us + 10;
+        timeout = time_us_64() + sample_period_us + 10;
         if (wait_for_adc_data_ready(timeout)) return 3;
+        busy_wait_us(1);
         read_full_adc_frame();
         unpack_adc_sample_data();
         for (uint ch=0; ch < N_CHAN; ++ch) {
@@ -281,6 +318,10 @@ void sample_channels_once()
     //
     vregister[3] = 0; // Immediate mode.
     vregister[2] = 1; // One sample set.
+    // Note that, even though we ask for one sample,
+    // two sample reads will be made because there will be 1 sample
+    // leading to the immediate trigger event and one after trigger.
+    // It should not matter.
     sampling_error_flag = sample_channels();
     //
     // Restore register values.
@@ -441,7 +482,7 @@ void interpret_command(char* cmdStr)
                 token_ptr = strtok(NULL, sep_tok);
                 if (token_ptr) {
                     // Assume text is value for register.
-                    v = (int16_t) atoi(token_ptr);
+                    v = (int) atoi(token_ptr);
                     if (i != 1) {
                         // Accept user-specified value.
                         vregister[i] = v;
@@ -549,18 +590,33 @@ int main()
 	//
     gpio_init(SPI1_CSn_PIN);
     gpio_set_dir(SPI1_CSn_PIN, GPIO_OUT);
+    gpio_set_slew_rate(SPI1_CSn_PIN, GPIO_SLEW_RATE_FAST);
+    gpio_set_drive_strength(SPI1_CSn_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_put(SPI1_CSn_PIN, 1); // High to deselect.
-    spi_init(spi1, 4000*1000); // Not so fast for prototype build.
+    //
+    spi_init(spi1, 4000*1000); // Not so fast for stripboard prototype build.
+    spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
     gpio_set_function(SPI1_RX_PIN, GPIO_FUNC_SPI);
     gpio_set_function(SPI1_TX_PIN, GPIO_FUNC_SPI);
+    gpio_set_slew_rate(SPI1_TX_PIN, GPIO_SLEW_RATE_FAST);
+    gpio_set_drive_strength(SPI1_TX_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_set_function(SPI1_CLK_PIN, GPIO_FUNC_SPI);
+    gpio_set_slew_rate(SPI1_CLK_PIN, GPIO_SLEW_RATE_FAST);
+    gpio_set_drive_strength(SPI1_CLK_PIN, GPIO_DRIVE_STRENGTH_12MA);
+    //
     gpio_init(DRDYn_PIN);
     gpio_set_dir(DRDYn_PIN, GPIO_IN);
+    //
     gpio_init(SYNCHn_PIN);
     gpio_set_dir(SYNCHn_PIN, GPIO_OUT);
+    gpio_set_slew_rate(SYNCHn_PIN, GPIO_SLEW_RATE_FAST);
+    gpio_set_drive_strength(SYNCHn_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_put(SYNCHn_PIN, 1); // Idle high.
+    //
     // We use PWM slice 4A on GPIO8 (CLKIN_PIN).
     gpio_set_function(CLKIN_PIN, GPIO_FUNC_PWM);
+    gpio_set_slew_rate(CLKIN_PIN, GPIO_SLEW_RATE_FAST);
+    gpio_set_drive_strength(CLKIN_PIN, GPIO_DRIVE_STRENGTH_12MA);
 	//
 	// We output an event pin that gets buffered by the COMMS MCU
 	// and reflected onto the system event line.
