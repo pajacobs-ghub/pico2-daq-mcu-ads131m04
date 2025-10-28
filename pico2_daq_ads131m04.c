@@ -19,7 +19,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.2 2025-07-13 Pico2 as DAQ-MCU"
+#define VERSION_STR "v0.3 2025-10-28 Pico2 as DAQ-MCU"
 
 // Names for the GPIO pins.
 const uint READY_PIN = 22;
@@ -112,7 +112,7 @@ int32_t vregister[NUMREG];
 
 void set_registers_to_original_values()
 {
-    // [FIX-ME] Slow f_CLKIN for stripboard prototype.
+	// Reduced frequency to convert accurately on strip-board and Jeremy's PCB REV.1
     vregister[0] = 8192/4; // Master clock frequency f_CLKIN for ADS131M04, in kHz
     vregister[1] = 1024;   // Over-sampling ratio for the ADS131M04, default 1024.
     vregister[2] = 128;    // number of samples in record after trigger event
@@ -526,7 +526,10 @@ void interpret_command(char* cmdStr)
     case 'I':
         // Immediately take a single sample set and report values.
         sample_channels_once();
-        printf("I %s\n", sample_set_to_str(0));
+        // Send back the second set of samples to allow 
+        // the ADC more time to settle.
+        printf("I %s\n", sample_set_to_str(1));
+        // Turns out that this makes no observable difference.
         break;
     case 'P':
         // Report the selected sample set for the configured channels.
@@ -595,7 +598,9 @@ int main()
     gpio_set_drive_strength(SPI1_CSn_PIN, GPIO_DRIVE_STRENGTH_12MA);
     gpio_put(SPI1_CSn_PIN, 1); // High to deselect.
     //
-    spi_init(spi1, 4000*1000); // Not so fast for stripboard prototype build.
+    // Limit SPI clock to 4MHz for strip-board prototype.
+    // Allow higher for Jeremy's PCB.
+    spi_init(spi1, 12000*1000);
     spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
     gpio_set_function(SPI1_RX_PIN, GPIO_FUNC_SPI);
     gpio_set_function(SPI1_TX_PIN, GPIO_FUNC_SPI);
