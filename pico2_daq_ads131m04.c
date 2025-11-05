@@ -506,7 +506,7 @@ void interpret_command(char* cmdStr)
         // Set the values of the registers to those values hard-coded
         // into this firmware.  A factory default, so to speak.
         set_registers_to_original_values();
-        printf("F vregisters reset\n");
+        printf("F registers reset\n");
         break;
     case 'g':
         // Start the sampling process.
