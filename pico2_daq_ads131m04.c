@@ -4,7 +4,7 @@
 //
 // PJ 2025-07-12: Adapt the interpreter from the BU79100G firmware.
 //    2025-07-13: Functions to drive the ADS131M04 with default settings.
-//
+// JM 2025-11-09: Added OSR writing.   
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
@@ -19,7 +19,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.3 2025-10-28 Pico2 as DAQ-MCU"
+#define VERSION_STR "v0.4 2025-10-28 Pico2 as DAQ-MCU"
 
 // Names for the GPIO pins.
 const uint READY_PIN = 22;
