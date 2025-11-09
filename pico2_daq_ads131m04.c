@@ -287,23 +287,18 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     //
     set_adc_command(0); // NULL command; we just want to read sampled data.
     //
-    // Assert the SYNCHn pin low long enough to reset the ADS131M04.
-    uint64_t timeout = time_us_64() + 10;
-    uint64_t period_CLKIN_ns = 1000000 / f_CLKIN_kHz;
-    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 99;
-    //
-    // Set the OSR in the CLOCK register.
+    // Set the OSR in the CLOCK register before the first SYNC.
     set_adc_osr(OSR);
     // After writing a register, wait for response with a generous timeout.
-    // The chip behavior is undefined until SYNC is pulsed, so use a long timeout.
-    timeout = time_us_64() + 10000; // 10ms timeout
+    uint64_t timeout = time_us_64() + 10000; // 10ms timeout
     if (wait_for_adc_data_ready(timeout)) return 4;
     busy_wait_us(1);
     read_full_adc_frame(); // Read response frame from register write.
     //
-    // Pulse SYNC again to activate the new OSR setting and clear FIFOs.
+    // Assert the SYNCHn pin to reset the ADS131M04 and activate the new OSR setting.
     timeout = time_us_64() + 10;
-    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 98;
+    uint64_t period_CLKIN_ns = 1000000 / f_CLKIN_kHz;
+    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 99;
     //
     // After SYNC, the filter needs time to settle based on the OSR value.
     // Per datasheet Table 7-15, settling times vary by OSR (in CLKIN cycles):
