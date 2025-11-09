@@ -162,6 +162,56 @@ static inline void set_adc_command(uint16_t cmd)
     }
 }
 
+static inline void write_adc_register(uint8_t reg_addr, uint16_t reg_value)
+// Write a 16-bit value to an ADS131M04 register.
+// The WREG command format is: 010a aaaa annn nnnn
+// where a is the register address and n is the number of registers to write minus 1.
+// For a single register write, n=0.
+{
+    uint16_t cmd = 0x4000 | ((reg_addr & 0x1F) << 7); // WREG command with address
+    outgoing_bytes_adc[0] = (uint8_t)((cmd & 0xff00) >> 8);
+    outgoing_bytes_adc[1] = (uint8_t)(cmd & 0x00ff);
+    outgoing_bytes_adc[2] = (uint8_t)((reg_value & 0xff00) >> 8);
+    outgoing_bytes_adc[3] = (uint8_t)(reg_value & 0x00ff);
+    for (uint i = 4; i < N_BYTES_IN_FRAME; ++i) {
+        outgoing_bytes_adc[i] = (uint8_t)0;
+    }
+}
+
+static inline void set_adc_osr(uint32_t OSR)
+// Set the oversampling ratio by writing to the CLOCK register (0x01).
+// This function preserves channel enable bits (all enabled) and sets appropriate power mode.
+// OSR values: 64(TBM), 128, 256, 512, 1024, 2048, 4096, 8192, 16256
+{
+    uint16_t clock_reg = 0x0F00; // All channels enabled (bits 11:8)
+    
+    // Set OSR bits based on value
+    if (OSR == 64) {
+        clock_reg |= 0x0020; // Set TBM bit (bit 5), OSR[2:0] should be 000
+        // Don't set OSR[2:0] bits, they stay at 0
+    } else {
+        // Clear TBM bit (bit 5) and set OSR[2:0] in bits 4:2
+        uint8_t osr_bits;
+        switch (OSR) {
+            case 128:   osr_bits = 0; break;
+            case 256:   osr_bits = 1; break;
+            case 512:   osr_bits = 2; break;
+            case 1024:  osr_bits = 3; break; // default
+            case 2048:   osr_bits = 4; break;
+            case 4096:  osr_bits = 5; break;
+            case 8192:  osr_bits = 6; break;
+            case 16256: osr_bits = 7; break;
+            default:    osr_bits = 3; break; // default to 1024 if invalid
+        }
+        clock_reg |= (osr_bits << 2);
+    }
+    
+    // Set power mode to High-resolution (bits 1:0 = 10b)
+    clock_reg |= 0x0002;
+    
+    write_adc_register(0x01, clock_reg);
+}
+
 static inline void read_full_adc_frame()
 {
     gpio_put(SPI1_CSn_PIN, 0); // Select the ADS131M04.
@@ -207,10 +257,6 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint32_t OSR = vregister[1];
     int32_t sample_period_us = 2000L * OSR / f_CLKIN_kHz;
     //
-    // [FIX-ME] Need to set the CLOCK register on the ADS131M04 to a suitable value.
-    // For the moment, we assume the default OSR=1024 and f_CLKIN = 8192kHz,
-    // to get a sample period of 250 microseconds.
-    //
     uint8_t mode = (uint8_t)vregister[3];
 # define TRIGGER_IMMEDIATE 0
 # define TRIGGER_INTERNAL 1
@@ -237,7 +283,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     float div = (float)f_clk_sys / f_CLKIN_kHz / 4;
     pwm_set_clkdiv(slice_num, div);
     pwm_set_enabled(slice_num, true);
-    busy_wait_us(100); // Let the ADS131M04 registers settle.
+    busy_wait_us(500); // Let the ADS131M04 clock and internal circuits settle.
     //
     set_adc_command(0); // NULL command; we just want to read sampled data.
     //
@@ -246,22 +292,56 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint64_t period_CLKIN_ns = 1000000 / f_CLKIN_kHz;
     if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 99;
     //
-    // Now read two frames and discard. (This may not be necessary.)
-    timeout = time_us_64() + 3*sample_period_us + 10;
-    if (wait_for_adc_data_ready(timeout)) return 1;
+    // Set the OSR in the CLOCK register.
+    set_adc_osr(OSR);
+    // After writing a register, wait for response with a generous timeout.
+    // The chip behavior is undefined until SYNC is pulsed, so use a long timeout.
+    timeout = time_us_64() + 10000; // 10ms timeout
+    if (wait_for_adc_data_ready(timeout)) return 4;
     busy_wait_us(1);
-    read_full_adc_frame();
-    timeout = time_us_64() + sample_period_us + 10;
-    if (wait_for_adc_data_ready(timeout)) return 2;
-    busy_wait_us(1);
-    read_full_adc_frame();
+    read_full_adc_frame(); // Read response frame from register write.
+    //
+    // Pulse SYNC again to activate the new OSR setting and clear FIFOs.
+    timeout = time_us_64() + 10;
+    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 98;
+    //
+    // After SYNC, the filter needs time to settle based on the OSR value.
+    // Per datasheet Table 7-15, settling times vary by OSR (in CLKIN cycles):
+    // OSR=64:728, 128:856, 256:1112, 512:1624, 1024:2648, 2048:4696, 4096:8792, 8192:16984, 16384:33368
+    uint32_t settling_time_clkin_cycles;
+    switch (OSR) {
+        case 64:    settling_time_clkin_cycles = 728; break;
+        case 128:   settling_time_clkin_cycles = 856; break;
+        case 256:   settling_time_clkin_cycles = 1112; break;
+        case 512:   settling_time_clkin_cycles = 1624; break;
+        case 1024:  settling_time_clkin_cycles = 2648; break;
+        case 2048:  settling_time_clkin_cycles = 4696; break;
+        case 4096:  settling_time_clkin_cycles = 8792; break;
+        case 8192:  settling_time_clkin_cycles = 16984; break;
+        case 16256: settling_time_clkin_cycles = 33368; break;
+        default:    settling_time_clkin_cycles = 2648; break; // default for OSR=1024
+    }
+    // Convert settling time from CLKIN cycles to microseconds
+    // settling_time_us = settling_time_clkin_cycles / f_CLKIN_kHz * 1000
+    uint32_t settling_time_us = (settling_time_clkin_cycles * 1000) / f_CLKIN_kHz;
+    
+    // Wait for the settling time, then discard settled data frames.
+    // We need to read at least 3 frames to clear the pipeline.
+    busy_wait_us(settling_time_us);
+    for (int i = 0; i < 3; i++) {
+        timeout = time_us_64() + sample_period_us + 1000;
+        if (wait_for_adc_data_ready(timeout)) return (1 + i);
+        busy_wait_us(1);
+        read_full_adc_frame();
+    }
     //
     while (samples_remaining > 0) {
         sampling_LED_ON();
         raise_flag_pin(); // to allow timing via a logic probe.
         //
         // Take the analog sample set.
-        timeout = time_us_64() + sample_period_us + 10;
+        // Keep timeout tight to avoid FIFO issues (max 2 samples in FIFO)
+        timeout = time_us_64() + sample_period_us + 1000;
         if (wait_for_adc_data_ready(timeout)) return 3;
         busy_wait_us(1);
         read_full_adc_frame();
@@ -484,14 +564,9 @@ void interpret_command(char* cmdStr)
                 if (token_ptr) {
                     // Assume text is value for register.
                     v = (int) atoi(token_ptr);
-                    if (i != 1) {
-                        // Accept user-specified value.
-                        vregister[i] = v;
-                        printf("s reg[%u] set to %d\n", i, v);
-                    } else {
-                        // Ignore user input.
-                        printf("s reg[%u] set to %d\n", i, N_CHAN);
-                    }
+                    // Accept user-specified value.
+                    vregister[i] = v;
+                    printf("s reg[%u] set to %d\n", i, v);
                 } else {
                     printf("s error: no value given.\n");
                 }
