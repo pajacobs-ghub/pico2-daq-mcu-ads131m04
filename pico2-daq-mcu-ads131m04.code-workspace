@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../eDAQS-programs"
+		},
+		{
+			"path": "../pic18f16q41-COMMS-2-MCU"
 		}
 	],
 	"settings": {
