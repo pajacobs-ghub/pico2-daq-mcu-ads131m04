@@ -98,6 +98,7 @@ static int32_t sample_data[N_CHAN];
 int32_t data[N_FULLWORDS];
 uint32_t next_fullword_index_in_data;
 uint8_t fullword_index_has_wrapped_around;
+uint32_t trigger_fullword_index; // Index in data[] where trigger occurred
 
 // We are going to communicate with the ADS131M04 with its default word size
 // of 24 bits and a full frames of 6 words but we will look at this data as
@@ -127,6 +128,14 @@ void set_registers_to_original_values()
 static inline uint32_t oldest_fullword_index_in_data()
 {
     return (fullword_index_has_wrapped_around) ? next_fullword_index_in_data : 0;
+}
+
+void clear_data_array()
+{
+    // Clear the data[N_FULLWORDS] array to all zeros.
+    for (uint32_t i = 0; i < N_FULLWORDS; ++i) {
+        data[i] = 0;
+    }
 }
 
 static inline int assert_adc_synch(uint32_t duration_us, uint64_t timeout)
@@ -267,10 +276,10 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint16_t trigger_level = (uint16_t) vregister[5];
     uint8_t trigger_slope = (uint8_t)vregister[6];
     //
-    release_event();
     sampling_error_flag = 0;
     next_fullword_index_in_data = 0; // Start afresh, at index 0.
     fullword_index_has_wrapped_around = 0;
+    trigger_fullword_index = 0; // Will be updated when trigger occurs
     uint8_t post_event = 0;
     uint32_t samples_remaining = vregister[2];
     //
@@ -355,6 +364,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             switch (mode) {
             case TRIGGER_IMMEDIATE:
                 post_event = 1;
+                trigger_fullword_index = next_fullword_index_in_data;
                 assert_event();
                 break;
             case TRIGGER_INTERNAL: {
@@ -363,6 +373,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
                 if ((trigger_slope == 1 && s >= trigger_level) ||
                     (trigger_slope == 0 && s <= trigger_level)) {
                     post_event = 1;
+                    trigger_fullword_index = next_fullword_index_in_data;
                     assert_event();
                 }
                 }
@@ -370,6 +381,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             case TRIGGER_EXTERNAL:
                 if (read_system_event_pin() == 0) {
                     post_event = 1;
+                    trigger_fullword_index = next_fullword_index_in_data;
                 }
             } // end switch
         }
@@ -615,12 +627,58 @@ void interpret_command(char* cmdStr)
             printf("P error: no index given.\n");
         }
         break;
+    case 'a':
+        // Report index of oldest sample set in data[].
+        printf("a %u\n", oldest_fullword_index_in_data() / 4);
+        break;
+    case 'B':
+        // Send the selected sample set as hex-encoded bytes.
+        // More efficient than decimal 'P' command, but safe for text transmission.
+        // An index of 0 refers to the oldest sample set.
+        // Each sample is 4 bytes (int32_t), sent as 8 hex characters (little-endian).
+        token_ptr = strtok(&cmdStr[1], sep_tok);
+        if (token_ptr) {
+            // Found some nonblank text, assume sample index.
+            uint32_t ii = (uint32_t) atol(token_ptr);
+            // Calculate the word index for the selected sample set.
+            uint32_t word_index = oldest_fullword_index_in_data() + 4*ii;
+            if (word_index >= N_FULLWORDS) { word_index -= N_FULLWORDS; }
+            // Send acknowledgment header and hex data
+            printf("B ");
+            // Send hex-encoded bytes for each channel (4 channels × 8 hex chars = 32 chars total)
+            for (uint8_t ch = 0; ch < N_CHAN; ch++) {
+                int32_t sample = data[word_index + ch];
+                uint8_t* bytes = (uint8_t*)&sample;
+                // Send 4 bytes as 8 hex characters (little-endian order)
+                for (int b = 0; b < 4; b++) {
+                    printf("%02x", bytes[b]);
+                }
+            }
+            printf("\n");
+        } else {
+            printf("B error: no index given.\n");
+        }
+        break;
     case 'z':
         // Release the EVENT# line.
         // Presumably this line has been help low following an internal
         // trigger event during the sampling process.
         release_event();
         printf("z Pico2-EVENT line released\n");
+        break;
+    case 'm':
+        // Report the maximum number of sample sets that can be stored in SRAM.
+        printf("m %d\n", MAX_N_SAMPLES);
+        break;
+    case 'T':
+        // Report the trigger index (sample number where trigger occurred).
+        // This is the fullword index, divide by 4 to get sample number.
+        printf("T %u\n", trigger_fullword_index / 4);
+        break;
+    case '0':
+        // Clear the data[N_FULLWORDS] array to all zeros.
+        clear_data_array();
+        printf("0 data[ ] array cleared\n");
         break;
 	default:
 		printf("%c error: Unknown command\n", cmdStr[0]);
