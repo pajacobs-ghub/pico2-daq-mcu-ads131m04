@@ -21,7 +21,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.41 2025-10-28 Pico2 as DAQ-MCU"
+#define VERSION_STR "v0.41 2025-11-10 Pico2 as DAQ-MCU"
 
 // Names for the GPIO pins.
 const uint READY_PIN = 22;
@@ -620,7 +620,7 @@ void interpret_command(char* cmdStr)
         // Presumably this line has been help low following an internal
         // trigger event during the sampling process.
         release_event();
-        printf("z event line released\n");
+        printf("z Pico2-EVENT line released\n");
         break;
 	default:
 		printf("%c error: Unknown command\n", cmdStr[0]);
