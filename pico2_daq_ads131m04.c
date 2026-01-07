@@ -27,7 +27,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.43 Pico2 as DAQ-MCU 2026-01-07"
+#define VERSION_STR "v0.44 Pico2 as DAQ-MCU 2026-01-08"
 
 // Names for the GPIO pins.
 // A. For interaction with the PIC18F26Q71 COMMS-MCU.
@@ -231,7 +231,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
                     // Put the data into the outgoing byte buffer in big-endian layout.
                     tx_buffer[4*i] = (uint8_t) (RTDP_data_words[i] >> 24);
                     tx_buffer[4*i+1] = (uint8_t) (RTDP_data_words[i] >> 16);
-                    tx_buffer[4*i+1] = (uint8_t) (RTDP_data_words[i] >> 8);
+                    tx_buffer[4*i+2] = (uint8_t) (RTDP_data_words[i] >> 8);
                     tx_buffer[4*i+3] = (uint8_t) RTDP_data_words[i];
                 }
                 if (!my_spi_is_initialized) {
