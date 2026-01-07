@@ -4,7 +4,7 @@
 //
 // PJ 2025-07-12: Adapt the interpreter from the BU79100G firmware.
 //    2025-07-13: Functions to drive the ADS131M04 with default settings.
-// JM 2025-11-09: Added OSR writing.   
+// JM 2025-11-09: Added OSR writing.
 // JM 2025-11-10: Ported PJ's changes to fix EVENT# GPIO pull-ups.
 
 #include "pico/stdlib.h"
@@ -21,7 +21,7 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.41 2025-11-10 Pico2 as DAQ-MCU"
+#define VERSION_STR "v0.42 Pico2 as DAQ-MCU 2026-01-07"
 
 // Names for the GPIO pins.
 const uint READY_PIN = 22;
@@ -195,7 +195,7 @@ static inline void set_adc_osr(uint32_t OSR)
 // OSR values: 64(TBM), 128, 256, 512, 1024, 2048, 4096, 8192, 16256
 {
     uint16_t clock_reg = 0x0F00; // All channels enabled (bits 11:8)
-    
+    //
     // Set OSR bits based on value
     if (OSR == 64) {
         clock_reg |= 0x0020; // Set TBM bit (bit 5), OSR[2:0] should be 000
@@ -216,10 +216,10 @@ static inline void set_adc_osr(uint32_t OSR)
         }
         clock_reg |= (osr_bits << 2);
     }
-    
+    //
     // Set power mode to High-resolution (bits 1:0 = 10b)
     clock_reg |= 0x0002;
-    
+    //
     write_adc_register(0x01, clock_reg);
 }
 
@@ -330,7 +330,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     // Convert settling time from CLKIN cycles to microseconds
     // settling_time_us = settling_time_clkin_cycles / f_CLKIN_kHz * 1000
     uint32_t settling_time_us = (settling_time_clkin_cycles * 1000) / f_CLKIN_kHz;
-    
+    //
     // Wait for the settling time, then discard settled data frames.
     // We need to read at least 3 frames to clear the pipeline.
     busy_wait_us(settling_time_us);
@@ -610,7 +610,7 @@ void interpret_command(char* cmdStr)
     case 'I':
         // Immediately take a single sample set and report values.
         sample_channels_once();
-        // Send back the second set of samples to allow 
+        // Send back the second set of samples to allow
         // the ADC more time to settle.
         printf("I %s\n", sample_set_to_str(1));
         // Turns out that this makes no observable difference.
@@ -796,4 +796,3 @@ int main()
     }
     return 0;
 }
-
