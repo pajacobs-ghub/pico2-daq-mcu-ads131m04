@@ -6,13 +6,19 @@
 //    2025-07-13: Functions to drive the ADS131M04 with default settings.
 // JM 2025-11-09: Added OSR writing.
 // JM 2025-11-10: Ported PJ's changes to fix EVENT# GPIO pull-ups.
+// PJ 2026-01-07: Service the Real-Time Data Port (RTDP) with the second core.
+//                Essentially a copy of the corresponding code developed for
+//                the Pico2+BU79100G DAQ board.
 
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "pico/util/queue.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
 #include "hardware/timer.h"
 #include "hardware/spi.h"
+#include "hardware/dma.h"
 #include "hardware/pwm.h"
 #include "pico/binary_info.h"
 #include <stdio.h>
@@ -21,13 +27,17 @@
 #include <math.h>
 #include <ctype.h>
 
-#define VERSION_STR "v0.42 Pico2 as DAQ-MCU 2026-01-07"
+#define VERSION_STR "v0.43 Pico2 as DAQ-MCU 2026-01-07"
 
 // Names for the GPIO pins.
+// A. For interaction with the PIC18F26Q71 COMMS-MCU.
+// UART0_TX on GP0 (default)
+// UART0_RX in GP1 (default)
 const uint READY_PIN = 22;
 const uint FLAG_PIN = 26;
 const uint Pico2_EVENT_PIN = 3;
 const uint SYSTEM_EVENTn_PIN = 2;
+// B. For interaction with the ADS131M04 ADC chip.
 const uint SYNCHn_PIN = 7;
 const uint CLKIN_PIN = 8;
 const uint SPI1_CSn_PIN = 9;
@@ -35,6 +45,14 @@ const uint SPI1_CLK_PIN =10 ;
 const uint SPI1_TX_PIN = 11;
 const uint SPI1_RX_PIN = 12;
 const uint DRDYn_PIN = 13;
+// C. For implementing the Real-Time Data Port.
+const uint SPI0_CSn_PIN = 17;
+const uint SPI0_SCK_PIN = 18;
+const uint SPI0_TX_PIN = 19;
+const uint RTDP_DE_PIN = 20;
+const uint RTDP_REn_PIN = 21;
+const uint DATA_RDY_PIN = 27;
+
 
 static inline void assert_ready()
 {
@@ -84,6 +102,28 @@ static inline void sampling_LED_OFF()
     gpio_put(LED_PIN, 0);
 }
 
+static inline void assert_data_ready()
+{
+    gpio_put(DATA_RDY_PIN, 1);
+}
+
+static inline void clear_data_ready()
+{
+    gpio_put(DATA_RDY_PIN, 0);
+}
+
+static inline void enable_RTDP_transceiver()
+{
+    gpio_put(RTDP_REn_PIN, 0);
+    gpio_put(RTDP_DE_PIN, 1);
+}
+
+static inline void disable_RTDP_transceiver()
+{
+    gpio_put(RTDP_REn_PIN, 1);
+    gpio_put(RTDP_DE_PIN, 0);
+}
+
 // Unlike the AVR DAQ firmware, we are going to hard-code the number of
 // channels at 4 (because we are using a single ADS131M04 chip) and we
 // are going to use int32_t as the sample type.
@@ -110,7 +150,7 @@ static uint8_t outgoing_bytes_adc[N_BYTES_IN_FRAME];
 static int sampling_error_flag;
 
 // Parameters controlling the device are stored in virtual config registers.
-#define NUMREG 7
+#define NUMREG 8
 int32_t vregister[NUMREG];
 
 void set_registers_to_original_values()
@@ -123,7 +163,169 @@ void set_registers_to_original_values()
     vregister[4] = 0;      // trigger channel for internal trigger
     vregister[5] = 10000;  // trigger level as a signed integer
     vregister[6] = 1;      // trigger slope 0=sample-below-level 1=sample-above-level
+    vregister[7] = 0;      // advertising period (in microseconds) for the RTDP
 }
+//
+// core1 services the Real-Time Data Port
+// which makes a snapshot of the sampled data available
+// to an external SPI master device.
+//
+// The main loop of the RTDP service function acts upon commands
+// sent from core0 via the queue.
+//
+queue_t RTDP_command_fifo;
+#define RTDP_FIFO_LENGTH 1
+// The commands themselves are uint values.
+#define RTDP_NOP 0
+#define RTDP_STOP 99
+#define RTDP_ADVERTISE_NEW_DATA 1
+// [FIX-ME] Maybe we should use an atomic variable to indicate the status.
+static uint RTDP_status;
+// The status values are also uint values.
+#define RTDP_IDLE 0
+#define RTDP_BUSY 1
+// core0 will drop a copy of new sample data here.
+static int32_t RTDP_data_words[N_CHAN];
+
+void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
+{
+    uint8_t tx_buffer[N_CHAN*4]; // Send out the data from this buffer.
+    // The data sheet seems to indicate that we have to collect
+    // the incoming data, even if we don't want it.
+    uint8_t rx_buffer[N_CHAN*4]; // Dump the unwanted data here.
+    //
+    // Transfer bytes to and from the SPI peripheral via DMA channels.
+    const uint dma_spi0_tx = dma_claim_unused_channel(true);
+    const uint dma_spi0_rx = dma_claim_unused_channel(true);
+    dma_channel_config tx_cfg = dma_channel_get_default_config(dma_spi0_tx);
+    dma_channel_config rx_cfg = dma_channel_get_default_config(dma_spi0_rx);
+    channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&tx_cfg, true);
+    channel_config_set_write_increment(&tx_cfg, false);
+    channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&rx_cfg, false);
+    channel_config_set_write_increment(&rx_cfg, true);
+    //
+    uint timeout_period_us = vregister[7];
+    // At 2MHz, 16 bytes transfer in about 64us,
+    // so it does not make much sense to have a very short timeout.
+    if (timeout_period_us < 100) timeout_period_us = 100;
+    //
+    // The main responsibility of core1 is to look for incoming commands and act.
+    // This provides a synchronization mechanism, such that core1 advertises
+    // available data only when core0 has put some new data into RTP_data_words,
+    // and core0 will only put new data in that array while core1 is active and idle.
+    //
+    RTDP_status = RTDP_IDLE;
+    bool my_spi_is_initialized = false;
+    bool active = true;
+    while (active) {
+        // Wait until we are commanded to do something.
+        uint cmd = RTDP_NOP;
+        queue_remove_blocking(&RTDP_command_fifo, &cmd);
+        switch (cmd) {
+        case RTDP_ADVERTISE_NEW_DATA:
+            { // start new scope
+                RTDP_status = RTDP_BUSY;
+                for (uint i=0; i < N_CHAN; i++) {
+                    // Put the data into the outgoing byte buffer in big-endian layout.
+                    tx_buffer[4*i] = (uint8_t) (RTDP_data_words[i] >> 24);
+                    tx_buffer[4*i+1] = (uint8_t) (RTDP_data_words[i] >> 16);
+                    tx_buffer[4*i+1] = (uint8_t) (RTDP_data_words[i] >> 8);
+                    tx_buffer[4*i+3] = (uint8_t) RTDP_data_words[i];
+                }
+                if (!my_spi_is_initialized) {
+                    // We (conditionally) do the SPI module initialization here
+                    // because it may have been deinitialized by a timeout event,
+                    // or this may be the first use.
+                    // My reading of Section 12.3.4.4. Clock ratios in the data sheet
+                    // seems to indicate that we are limited to about 2MHz serial clock
+                    // in slave mode.
+                    // If we don't care about the MOSI data, we might go faster.
+                    spi_init(spi0, 2000*1000);
+                    spi_set_slave(spi0, true);
+                    spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
+                    gpio_set_function(SPI0_CSn_PIN, GPIO_FUNC_SPI);
+                    gpio_pull_up(SPI0_CSn_PIN);
+                    gpio_set_function(SPI0_SCK_PIN, GPIO_FUNC_SPI);
+                    gpio_pull_up(SPI0_SCK_PIN);
+                    gpio_set_function(SPI0_TX_PIN, GPIO_FUNC_SPI);
+                    // The dma-transfer requests are paced by the SPI peripheral.
+                    channel_config_set_dreq(&tx_cfg, spi_get_dreq(spi0, true)); // tx
+                    channel_config_set_dreq(&rx_cfg, spi_get_dreq(spi0, false)); // rx
+                    my_spi_is_initialized = true;
+                }
+                dma_channel_configure(dma_spi0_tx, &tx_cfg,
+                                      &spi_get_hw(spi0)->dr, // write address
+                                      tx_buffer, // read address
+                                      dma_encode_transfer_count(N_CHAN*2),
+                                      false); // start later...
+                dma_channel_configure(dma_spi0_rx, &rx_cfg,
+                                      rx_buffer, // write address
+                                      &spi_get_hw(spi0)->dr, // read address
+                                      dma_encode_transfer_count(N_CHAN*2),
+                                      false); // start later...
+                // At this point, the data bytes are ready to be sent via SPI0,
+                // so we can signal to the external supervisor device that there
+                // is data to collect.
+                dma_start_channel_mask((1u << dma_spi0_tx) | (1u << dma_spi0_rx));
+                assert_data_ready();
+                // It is up to the external device to collect all of the data
+                // by selecting the Pico2 as a slave SPI device and clocking out
+                // all of the bytes.
+                uint64_t timeout = time_us_64() + timeout_period_us;
+                // Wait for selection by the SPI-master device.
+                // If this does not happen within a reasonable time,
+                // we presume that the SPI-master device is not present
+                // or not paying attention to the DATA_RDY signal,
+                // so we cancel the data transfer.
+                while (gpio_get(SPI0_CSn_PIN)) {
+                    if (time_reached(timeout)) { goto timed_out; }
+                }
+                enable_RTDP_transceiver();
+                // Wait for the data to be clocked out.
+                while (dma_channel_is_busy(dma_spi0_tx) ||
+                       dma_channel_is_busy(dma_spi0_rx)) {
+                    if (time_reached(timeout)) { goto timed_out; }
+                }
+                // Wait for deselection by the SPI-master device.
+                while (!gpio_get(SPI0_CSn_PIN)) {
+                    if (time_reached(timeout)) { goto timed_out; }
+                }
+                // If we arrive here then the data has been transferred through
+                // the SPI peripheral
+                goto finish;
+            timed_out:
+                spi_deinit(spi0);
+                dma_channel_cleanup(dma_spi0_tx);
+                dma_channel_cleanup(dma_spi0_rx);
+                my_spi_is_initialized = false;
+            finish:
+                disable_RTDP_transceiver();
+                clear_data_ready();
+                RTDP_status = RTDP_IDLE;
+            } // end new scope
+            break;
+        case RTDP_STOP:
+            spi_deinit(spi0);
+            dma_channel_cleanup(dma_spi0_tx);
+            dma_channel_cleanup(dma_spi0_rx);
+            my_spi_is_initialized = false;
+            clear_data_ready();
+            RTDP_status = RTDP_IDLE;
+            active = false;
+            break;
+        default:
+            {} // do nothing for any other command value
+        }
+    } // end while
+    dma_channel_unclaim(dma_spi0_tx);
+    dma_channel_unclaim(dma_spi0_rx);
+} // end void core1_service_RTDP()
+
+//
+// core0 services the main sampling activity.
+//
 
 static inline uint32_t oldest_fullword_index_in_data()
 {
@@ -276,6 +478,13 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     uint16_t trigger_level = (uint16_t) vregister[5];
     uint8_t trigger_slope = (uint8_t)vregister[6];
     //
+    bool service_RTDP = (vregister[7] != 0);
+    uint cmd = RTDP_STOP;
+    if (service_RTDP) {
+        queue_init(&RTDP_command_fifo, sizeof(uint), RTDP_FIFO_LENGTH);
+        multicore_launch_core1(core1_service_RTDP);
+    }
+    //
     sampling_error_flag = 0;
     next_fullword_index_in_data = 0; // Start afresh, at index 0.
     fullword_index_has_wrapped_around = 0;
@@ -356,6 +565,16 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             data[next_fullword_index_in_data+ch] = sample_data[ch];
         }
         //
+        if (service_RTDP
+            && (queue_is_empty(&RTDP_command_fifo))
+            && RTDP_status == RTDP_IDLE) {
+            for (uint ch=0; ch < N_CHAN; ++ch) {
+                RTDP_data_words[ch] = sample_data[ch];
+            }
+            cmd = RTDP_ADVERTISE_NEW_DATA;
+            queue_add_blocking(&RTDP_command_fifo, &cmd);
+        }
+        //
         if (post_event) {
             // Trigger event has happened.
             samples_remaining--;
@@ -393,7 +612,22 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         }
         lower_flag_pin();
         sampling_LED_OFF();
-    } // end while
+    } // end while (main sampling loop)
+    //
+    if (service_RTDP) {
+        while (queue_is_full(&RTDP_command_fifo)) {
+            tight_loop_contents();
+        }
+        cmd = RTDP_STOP;
+        queue_add_blocking(&RTDP_command_fifo, &cmd);
+        while ((queue_is_full(&RTDP_command_fifo))
+               || (RTDP_status == RTDP_BUSY)) {
+            // We wait for the last RTDP command to finish.
+            tight_loop_contents();
+        }
+        queue_free(&RTDP_command_fifo);
+        multicore_reset_core1();
+    }
     //
     pwm_set_enabled(slice_num, false);
     // If we arrive here, there have been no observed failures.
@@ -710,6 +944,12 @@ int main()
     bi_decl(bi_1pin_with_name(CLKIN_PIN, "ADS131M04 CLKIN, PWM ouput pin"));
     bi_decl(bi_1pin_with_name(SPI1_CSn_PIN, "ADS131M04 chip select, output pin"));
     bi_decl(bi_3pins_with_func(SPI1_RX_PIN, SPI1_TX_PIN, SPI1_CLK_PIN, GPIO_FUNC_SPI));
+    bi_decl(bi_1pin_with_name(SPI0_CSn_PIN, "SPI0 slave-select input pin"));
+    bi_decl(bi_1pin_with_name(SPI0_SCK_PIN, "SPI0 clock input pin"));
+    bi_decl(bi_1pin_with_name(SPI0_TX_PIN, "SPI0 data output pin"));
+    bi_decl(bi_1pin_with_name(RTDP_DE_PIN, "RTDP transmit driver enable pin"));
+    bi_decl(bi_1pin_with_name(RTDP_REn_PIN, "RTDP read serial-clock enable pin"));
+    bi_decl(bi_1pin_with_name(DATA_RDY_PIN, "RTDP data-ready output pin"));
 	//
 	// Flash LED twice at start up.
 	//
@@ -770,6 +1010,23 @@ int main()
     gpio_set_dir(FLAG_PIN, GPIO_OUT);
     lower_flag_pin();
     sampling_error_flag = 0;
+    //
+    // Set up the Real-Time Data Port.
+    // First, the RS485 transceiver.
+    gpio_init(RTDP_DE_PIN);
+    gpio_set_dir(RTDP_DE_PIN, GPIO_OUT);
+    gpio_disable_pulls(RTDP_DE_PIN);
+    gpio_init(RTDP_REn_PIN);
+    gpio_set_dir(RTDP_REn_PIN, GPIO_OUT);
+    gpio_disable_pulls(RTDP_REn_PIN);
+    disable_RTDP_transceiver();
+    // Second, the DATA_RDY signal.
+    gpio_init(DATA_RDY_PIN);
+    gpio_set_dir(DATA_RDY_PIN, GPIO_OUT);
+    gpio_disable_pulls(DATA_RDY_PIN);
+    clear_data_ready();
+    // Third, use the SPI0 module as a slave, for transmit only,
+    // but defer its initialization until we need it.
     //
 	// Signal to the COMMS MCU that we are ready.
 	//
